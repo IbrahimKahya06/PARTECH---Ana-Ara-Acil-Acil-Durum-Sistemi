@@ -1,0 +1,563 @@
+/*
+ * ============================================================
+ *  PARTECH Hyperloop - Ana Araç Acil Durum Sistemi (ADS)
+ *  Mikrodenetleyici : Arduino MEGA 2560
+ *  Tarih            : 2026
+ * ============================================================
+ *
+ *  PIN HARİTASI
+ *  ─────────────────────────────────────────────────────────
+ *  D2  → Dijital Giriş  : Yuksek_Voltaj_Sicaklik_Girisi_1  (LOW = acil)
+ *  D3  → Dijital Giriş  : Yuksek_Voltaj_Sicaklik_Girisi_2  (LOW = acil)
+ *  D14 → Dijital Giriş  : Arayuz_Acil_Durum_Butonu_Giris   (HIGH = acil)
+ *  D15 → Dijital Giriş  : Raspberry_Pi_5_Canlilik_Giris     (LOW = acil)
+ *  D16 → Dijital Giriş  : Navigasyon_Canlilik_Giris         (LOW = acil)
+ *  D29 → Dijital Giriş  : Yuksek_Voltaj_Girisi_1            (LOW = acil)
+ *  D31 → Dijital Giriş  : Yuksek_Voltaj_Akim_Girisi_1       (LOW = acil)
+ *  D33 → Dijital Giriş  : Yuksek_Voltaj_Girisi_2            (LOW = acil)
+ *  D4  → Dijital Çıkış  : Acil_Durum_Cikisi_1
+ *  D7  → Dijital Çıkış  : Acil_Durum_Cikisi_2
+ *  D18 → Dijital Çıkış  : Kompresor_Cikis
+ *  D25 → DS18B20        : BT1_Sicaklik
+ *  D27 → DS18B20        : BT2_Sicaklik
+ *  A0  → ACS712 30A     : Akim_1 (I1)
+ *  A1  → Pil Takip Dev. : Voltaj_1 (V27)
+ *  A2  → ACS758LCB      : Akim_2 (I2)
+ *  A3  → Pil Takip Dev. : Voltaj_2 (V28)
+ *  A4  → 10 bar Basınç  : Basinc_1 (P1)
+ *  A5  → 10 bar Basınç  : Basinc_2 (P2) – Henüz sensör yok
+ * ============================================================
+ *
+ *  ACİL DURUM ÖNCELİK SIRASI (D4 / D7 kararı)
+ *  1. D2=LOW  YV Sıcaklık 1           → D4=LOW, D7=LOW
+ *  2. D3=LOW  YV Sıcaklık 2           → D4=LOW, D7=LOW
+ *  3. Batarya Sıcaklığı (BT1/BT2)     → D4=LOW, D7=LOW
+ *  4. D14=HIGH Arayüz Butonu          → D4=LOW, D7=HIGH
+ *  5. D15=LOW  RPi Canlılık           → D4=LOW, D7=HIGH
+ *  6. D16=LOW  Navigasyon Canlılık    → D4=LOW, D7=HIGH
+ *  7. D29=LOW  YV Girisi 1            → D4=LOW, D7=HIGH
+ *  8. D31=LOW  YV Akım Girisi 1       → D4=LOW, D7=HIGH
+ *  9. D33=LOW  YV Girisi 2            → D4=LOW, D7=HIGH
+ * 10. Basınç P1 < 3.5 bar             → D4=LOW, D7=HIGH
+ *  Normal (hiçbir koşul yok)          → D4=HIGH, D7=HIGH
+ * ============================================================
+ */
+
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// ─── Pin Tanımlamaları ──────────────────────────────────────
+const int PIN_YV_SICAKLIK_GIRIS_1 = 2;   // YV Sıcaklık Girişi 1  (LOW = acil)
+const int PIN_YV_SICAKLIK_GIRIS_2 = 3;   // YV Sıcaklık Girişi 2  (LOW = acil)
+const int PIN_ARAYUZ_BUTON_GIRIS  = 14;  // Arayüz Acil Durum Butonu (HIGH = acil)
+const int PIN_RPI_CANLILIK_GIRIS  = 15;  // Raspberry Pi 5 Canlılık  (LOW = acil)
+const int PIN_NAV_CANLILIK_GIRIS  = 16;  // Navigasyon Canlılık       (LOW = acil)
+const int PIN_YV_GIRIS_1          = 29;  // Yüksek Voltaj Girişi 1    (LOW = acil)
+const int PIN_YV_AKIM_GIRIS_1     = 31;  // Yüksek Voltaj Akım Girişi 1 (LOW = acil)
+const int PIN_YV_GIRIS_2          = 33;  // Yüksek Voltaj Girişi 2    (LOW = acil)
+const int PIN_ACIL_CIKIS_1        = 4;   // Acil Durum Çıkışı 1
+const int PIN_ACIL_CIKIS_2        = 7;   // Acil Durum Çıkışı 2
+const int PIN_KOMPRESOR_CIKIS     = 18;  // Kompresör Çıkışı
+const int PIN_BT1                 = 25;  // DS18B20 – BT1
+const int PIN_BT2                 = 27;  // DS18B20 – BT2
+const int PIN_AKIM_1              = A0;  // ACS712 30A – I1
+const int PIN_VOLTAJ_1            = A1;  // Pil Takip – V27
+const int PIN_AKIM_2              = A2;  // ACS758LCB – I2
+const int PIN_VOLTAJ_2            = A3;  // Pil Takip – V28
+const int PIN_BASINC_1            = A4;  // 10 bar Basınç – P1
+const int PIN_BASINC_2            = A5;  // 10 bar Basınç – P2 (sensör yok)
+
+
+// ─── DS18B20 Nesneleri ──────────────────────────────────────
+OneWire oneWireBT1(PIN_BT1);
+OneWire oneWireBT2(PIN_BT2);
+DallasTemperature sensorBT1(&oneWireBT1);
+DallasTemperature sensorBT2(&oneWireBT2);
+
+// ─── Sıcaklık Eşikleri ──────────────────────────────────────
+const float SICAKLIK_ESIK         = 55.0;   // °C
+const float SICAKLIK_HATA_ESIK    = -100.0; // Bu değerin altı DS18B20 hata okuması
+
+// ─── Basınç Eşikleri ────────────────────────────────────────
+const float BASINC_ACIL_DURUM_ALT = 3.5;  // bar  → Acil durum + Kompresör ON
+const float BASINC_ACIL_DURUM_UST = 5.0;  // bar  → Acil durumdan çık (kompresör devam)
+const float BASINC_KOMPRESYOR_ALT = 4.5;  // bar  → Sadece Kompresör ON (acil durum yok)
+const float BASINC_KOMPRESYOR_UST = 5.5;  // bar  → Kompresör OFF
+
+// ─── Basınç Sensörü Kalibrasyon Sabitleri ───────────────────
+// Sensör: 0-10 bar → 0.5V-4.5V analog çıkış (tipik)
+// Arduino A/D: 0-5V → 0-1023
+// Formül: bar = ((ADC / 1023.0) * 5.0 - 0.5) / (4.0 / 10.0)
+const float ADC_MAX               = 1023.0;
+const float VCC                   = 5.0;    // V
+const float SENSOR_V_MIN          = 0.5;    // V (0 bar)
+const float SENSOR_V_MAX          = 4.5;    // V (10 bar)
+const float BASINC_MAX_BAR        = 10.0;   // bar
+
+// ─── Akım Sensörü Kalibrasyon Sabitleri — Kanal Bazında ─────
+//
+// A0 → I1 → ACS712 30A
+//   Datasheet : 66 mV/A hassasiyet, VCC/2 = 2.5V → 0A
+//   Kalibrasyon (2 nokta ölçümü):
+//     Gerçek 12.0A → Ekran 75.00A   → katsayı: 12.0/75.0  = 0.1600
+//     Gerçek  8.5A → Ekran 55.96A   → katsayı: 8.5/55.96  = 0.1519
+//     Ortalama                       → katsayı: 0.156
+//
+// A2 → I2 → ACS758LCB (Eski I1 kalibrasyonunu devraldı)
+//   Datasheet : 40 mV/A (ACS758LCB-050B/100B)
+//   Kalibrasyon: Gerçek 10.30A → Ekran -52.46A → katsayı 4.06
+//
+const float I1_SENSITIVITY_MV_PER_A = 66.0;  // mV/A — ACS712 30A datasheet
+const float I2_SENSITIVITY_MV_PER_A = 40.0;  // mV/A — ACS758LCB (önceki I1 ile aynı)
+const float ADC_UNIT_PER_MV         = ADC_MAX / (VCC * 1000.0); // ADC/mV
+const int   CURRENT_NUM_SAMPLES     = 50;     // Ortalama örnek sayısı
+
+// ─── Kanal Başına Yön / İnce Ayar Katsayısı ─────────────────
+const float I1_KALIBRASYON = 0.156; // A0 — ACS712 30A: 2 nokta ölçümü ortalama
+const float I2_KALIBRASYON = 4.06;  // A2 — ACS758: eski I1 kalibrasyonu devralındı
+
+// Açılış kalibrasyonunda belirlenen sıfır-akım offset'leri (setup'ta hesaplanır)
+float zeroCurrentOffsetmV1 = 0.0;
+float zeroCurrentOffsetmV2 = 0.0;
+
+
+
+// ─── Pil Takip Devresi Voltaj Sabitleri ─────────────────────
+// Voltaj bölücü: R1=30kΩ, R2=7.5kΩ → Oran = (R1+R2)/R2 = 5
+// Formül: V_gercek = ADC_voltaj × ((R1+R2)/R2) × VOLTAGE_CALIBRATION
+const float R1 = 30000.0; // Ω
+const float R2 = 7500.0;  // Ω
+// V27 referans ölçümü: Multimetre=15.78V, A1 pin sinyal=1.276V
+//   Beklenen (teorik): 1.276 × 5.0 = 6.38V
+//   Gerçek           : 15.78V
+//   Kalibrasyon      : 15.78 / (1.276 × 5.0) = 15.78 / 6.38 = 2.474
+const float VOLTAGE_CALIBRATION = 2.474; // V27 ve V28 için
+
+
+// ─── Kalıcı Durum Değişkenleri ──────────────────────────────
+// true  → Kompresör dolum modunda (D18=LOW)
+// false → Kompresör bekleme modunda (D18=HIGH)
+bool kompresorAktif = false;
+
+// Basınç kaynaklı acil durum bayrağı — global tutulur çünkü
+// giriş (3.5 bar) ve çıkış (5.0 bar) eşikleri farklıdır (histerez).
+bool basincAcilDurum = false;
+
+// ─── Zamanlama ──────────────────────────────────────────────
+const unsigned long SERI_ARALIK_MS = 500; // Serial çıktı aralığı (ms)
+unsigned long sonSeriZaman         = 0;
+
+// ─── Akım Sensörü Otomatik Sıfır-Offset Yeniden Kalibrasyonu ─
+//
+// Sorun 1 (Remanence): Büyük DC akım geçince Hall sensörünün
+//   çekirdeği kalıcı mıknatıslanır. Akım kesilince sıfır noktası
+//   kayar → 4-5A gibi yanlış değerler kalır.
+// Sorun 2 (Satürasyon): Uzun süreli yüksek akımda çekirdeğin
+//   algılama hassasiyeti değişir → okuma zamanla kayar.
+//
+// Çözüm: kompresorAktif == false durumu 5 saniye boyunca
+//   sürdüğünde sıfır referansı yeniden ölçülür.
+//   Önceki geçiş bazlı yaklaşımın aksine bu yöntem;
+//   - Manuel güç kesmelerinde de çalışır (basınç hedefine
+//     ulaşıldığında kompresorAktif=false olur)
+//   - Geçici gürültüye karşı daha dayanıklıdır.
+//
+const unsigned long SIFIR_KALIBRASYON_BEKLEME_MS = 5000; // ms (5 saniye)
+unsigned long kompresorKapaliBaslangic = 0;    // Kompresör kapalı başlangıç zamanı
+bool kompresorKapaliSayiyoruz          = false; // Süre sayılıyor mu?
+bool sifirKalibrasyonYapildi           = false; // Bu kapalı periyotta yapıldı mı?
+
+// ─── EMA (Üstel Hareketli Ortalama) Filtresi — Akım Kanalları ─
+// Yüksek frekanslı gürültüyü yumuşatır.
+// Formül: ema_yeni = alpha * olcum + (1 - alpha) * ema_eski
+//   alpha yakın 1.0 → hızlı tepki, az filtre
+//   alpha yakın 0.0 → yavaş tepki, çok filtre
+// 0.15 değeri kompresör açma/kapama geçişlerinde makul bir
+// denge sağlar (~6-7 örnek zaman sabiti).
+const float EMA_ALPHA_AKIM = 0.15;
+float emaI1   = 0.0;
+float emaI2   = 0.0;
+bool  emaInit = false;
+
+
+
+
+// ─── Yardımcı Fonksiyon: ADC → Bar Dönüşümü (Ham) ──────────
+// Bu fonksiyon sensörün voltajını ham bar değerine çevirir.
+// Kalibrasyon dışı, doğrudan lineer dönüşüm — kalibreBasinc() tarafından düzeltilir.
+float adcToBar(int adcDeger) {
+  float voltaj = (adcDeger / ADC_MAX) * VCC;
+  float bar    = (voltaj - SENSOR_V_MIN) / ((SENSOR_V_MAX - SENSOR_V_MIN) / BASINC_MAX_BAR);
+  if (bar < 0.0) bar = 0.0;
+  return bar;
+}
+
+// ─── Yardımcı Fonksiyon: Basınç Sensörü Kalibrasyon Tablosu ─
+//
+// Sensör doğrusal davranmıyor ve 8 bar üzerinde elektriksel
+// doyuma (satürasyon) giriyor. Bu yüzden basit bir çarpan yeterli
+// değil — 9 ölçüm noktası arasında parça parça doğrusal interpolasyon
+// (piecewise linear) yapılıyor.
+//
+// Ölçüm noktaları (Barometre ↔ Serial Monitör karşılaştırması):
+//   Barometre │ P1_HAM   (Eski kod çıktısı)
+//   ──────────┼──────────────────────────────
+//    0.00 bar │  0.00
+//    1.00 bar │  0.53
+//    2.00 bar │  1.97
+//    3.00 bar │  3.33
+//    4.00 bar │  4.84
+//    5.00 bar │  6.18
+//    6.00 bar │  7.91
+//    7.00 bar │  9.15
+//    8.00 bar │ 10.70   ← Sensör fiziksel sınırı
+//    9.00 bar │ 10.93   ← Doyum bölgesi (güvenilmez)
+//   10.00 bar │ 10.96   ← Doyum bölgesi (güvenilmez)
+//
+// ⚠️ 8 bar üzeri fiziksel basınçlar sensörün ADC üst sınırına
+//    dayanmasından dolayı doğru ölçülemiyor. Maksimum güvenilir
+//    çıktı 8.00 bar ile sınırlandırıldı.
+//
+const int   P1_TABLO_BOYUT = 9;
+const float P1_HAM[P1_TABLO_BOYUT]    = {0.00, 0.53, 1.97, 3.33, 4.84, 6.18, 7.91, 9.15, 10.70};
+const float P1_GERCEK[P1_TABLO_BOYUT] = {0.00, 1.00, 2.00, 3.00, 4.00, 5.00, 6.00, 7.00,  8.00};
+
+float kalibreBasinc(float hamBar) {
+  // Alt sınır
+  if (hamBar <= P1_HAM[0]) return P1_GERCEK[0];
+  // Üst sınır — doyum bölgesi (9.15 ve üzeri) → 8.00 bar'a sabitle
+  if (hamBar >= P1_HAM[P1_TABLO_BOYUT - 1]) return P1_GERCEK[P1_TABLO_BOYUT - 1];
+
+  // İki komşu nokta arasında doğrusal interpolasyon
+  for (int i = 0; i < P1_TABLO_BOYUT - 1; i++) {
+    if (hamBar <= P1_HAM[i + 1]) {
+      float oran = (hamBar - P1_HAM[i]) / (P1_HAM[i + 1] - P1_HAM[i]);
+      return P1_GERCEK[i] + oran * (P1_GERCEK[i + 1] - P1_GERCEK[i]);
+    }
+  }
+  return P1_GERCEK[P1_TABLO_BOYUT - 1];
+}
+
+
+
+// ─── Yardımcı Fonksiyon: Akım Ölçümü ───────────────────────
+// 50 örnek ortalaması + sıfır-offset kaldırma + kanal bazlı sensitivity + yön katsayısı
+// sensitivityMVperA : O kanala özel sensör hassasiyeti (mV/A)
+// iKalibrasyon      : +1.0 (doğru yön) veya -1.0 (ters bağlı), ince ayar için ±küçük fark
+float measureCurrent(int pin, float zeroOffsetmV, float sensitivityMVperA, float iKalibrasyon) {
+  long toplam = 0;
+  for (int i = 0; i < CURRENT_NUM_SAMPLES; i++) {
+    toplam += analogRead(pin);
+  }
+  float voltajmV = ((float)toplam / CURRENT_NUM_SAMPLES) / ADC_UNIT_PER_MV;
+  float akim_A   = (voltajmV - zeroOffsetmV) / sensitivityMVperA;
+  akim_A         = akim_A * iKalibrasyon;
+  if (abs(akim_A) < 0.5) akim_A = 0.0; // Gürültü eşiği — ACS712 30A düzgün sinyal verir
+  return akim_A;
+}
+
+
+
+
+// ─── Yardımcı Fonksiyon: Voltaj Ölçümü (Pil Takip Devresi) ──
+// 50 örnek ortalaması + voltaj bölücü geri hesabı + deneysel kalibrasyon
+float measureVoltage(int pin) {
+  long toplam = 0;
+  for (int i = 0; i < CURRENT_NUM_SAMPLES; i++) {
+    toplam += analogRead(pin);
+  }
+  float adcOrtalama = (float)toplam / CURRENT_NUM_SAMPLES;
+  float adcVoltaj   = adcOrtalama * (VCC / ADC_MAX);
+  return (adcVoltaj * ((R1 + R2) / R2)) * VOLTAGE_CALIBRATION;
+}
+
+
+// ============================================================
+//  SETUP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+
+  // Dijital Girişler
+  pinMode(PIN_YV_SICAKLIK_GIRIS_1, INPUT);
+  pinMode(PIN_YV_SICAKLIK_GIRIS_2, INPUT);
+  pinMode(PIN_ARAYUZ_BUTON_GIRIS,  INPUT);
+  pinMode(PIN_RPI_CANLILIK_GIRIS,  INPUT);
+  pinMode(PIN_NAV_CANLILIK_GIRIS,  INPUT);
+  pinMode(PIN_YV_GIRIS_1,          INPUT);
+  pinMode(PIN_YV_AKIM_GIRIS_1,     INPUT);
+  pinMode(PIN_YV_GIRIS_2,          INPUT);
+
+
+  // Dijital Çıkışlar – Başlangıçta güvenli durum (HIGH = röle kapalı)
+  pinMode(PIN_ACIL_CIKIS_1,    OUTPUT);
+  pinMode(PIN_ACIL_CIKIS_2,    OUTPUT);
+  pinMode(PIN_KOMPRESOR_CIKIS, OUTPUT);
+
+  digitalWrite(PIN_ACIL_CIKIS_1,   HIGH);
+  digitalWrite(PIN_ACIL_CIKIS_2,   HIGH);
+  digitalWrite(PIN_KOMPRESOR_CIKIS, HIGH); // Kompresör başlangıçta kapalı
+
+  // DS18B20 başlatma
+  sensorBT1.begin();
+  sensorBT2.begin();
+
+  // ─── Akım Sensörü Sıfır-Offset Kalibrasyonu ─────────────────
+  // Açılışta, akım geçmiyorken her iki sensörden 50 okuma yapılır.
+  // Bu değer ilerleyen ölçümlerde sıfır referansı olarak kullanılır.
+  {
+    long sum1 = 0, sum2 = 0;
+    for (int i = 0; i < CURRENT_NUM_SAMPLES; i++) {
+      sum1 += analogRead(PIN_AKIM_1);
+      sum2 += analogRead(PIN_AKIM_2);
+      delay(5);
+    }
+    zeroCurrentOffsetmV1 = ((float)sum1 / CURRENT_NUM_SAMPLES) / ADC_UNIT_PER_MV;
+    zeroCurrentOffsetmV2 = ((float)sum2 / CURRENT_NUM_SAMPLES) / ADC_UNIT_PER_MV;
+  }
+} // setup() sonu
+
+// ============================================================
+//  LOOP
+// ============================================================
+void loop() {
+  // ─── 1. Dijital Girişleri Oku ─────────────────────────────
+  // NOT: D2 ve D3 YV Sıcaklık pinleri — LOW = alarm, HIGH = normal
+  //       Diğer canlılık pinleri de LOW = alarm, HIGH = normal
+  //       D14 Arayüz Butonu — HIGH = alarm, LOW = normal
+  bool yvSicaklik1Low  = (digitalRead(PIN_YV_SICAKLIK_GIRIS_1) == LOW);
+  bool yvSicaklik2Low  = (digitalRead(PIN_YV_SICAKLIK_GIRIS_2) == LOW);
+  bool arayuzButonHigh = (digitalRead(PIN_ARAYUZ_BUTON_GIRIS)  == HIGH);
+  bool rpiCanlilikLow  = (digitalRead(PIN_RPI_CANLILIK_GIRIS)  == LOW);
+  bool navCanlilikLow  = (digitalRead(PIN_NAV_CANLILIK_GIRIS)  == LOW);
+  bool yvGiris1Low     = (digitalRead(PIN_YV_GIRIS_1)          == LOW);
+  bool yvAkimGiris1Low = (digitalRead(PIN_YV_AKIM_GIRIS_1)     == LOW);
+  bool yvGiris2Low     = (digitalRead(PIN_YV_GIRIS_2)          == LOW);
+
+
+  // ─── 2. DS18B20 Sıcaklık Okuma ───────────────────────────
+  sensorBT1.requestTemperatures();
+  sensorBT2.requestTemperatures();
+  float bt1 = sensorBT1.getTempCByIndex(0);
+  float bt2 = sensorBT2.getTempCByIndex(0);
+
+  // Sıcaklık acil durum kontrolü (hata değerlerini yoksay)
+  bool bt1Gecerli        = (bt1 > SICAKLIK_HATA_ESIK);
+  bool bt2Gecerli        = (bt2 > SICAKLIK_HATA_ESIK);
+  bool sicaklikAcilDurum = false;
+
+  if (bt1Gecerli && bt1 > SICAKLIK_ESIK) sicaklikAcilDurum = true;
+  if (bt2Gecerli && bt2 > SICAKLIK_ESIK) sicaklikAcilDurum = true;
+
+  // ─── 3. Analog Okumalar ───────────────────────────────────
+
+  // — Ham akım ölçümü (50 örnekli ortalama + offset + kanal bazlı kalibrasyon) —
+  float i1_raw = measureCurrent(PIN_AKIM_1, zeroCurrentOffsetmV1, I1_SENSITIVITY_MV_PER_A, I1_KALIBRASYON);
+  float i2_raw = measureCurrent(PIN_AKIM_2, zeroCurrentOffsetmV2, I2_SENSITIVITY_MV_PER_A, I2_KALIBRASYON);
+
+  // — EMA (Üstel Hareketli Ortalama) filtresi —
+  // İlk döngüde EMA'yı ham değere eşitle (ani başlangıç spike'ını önler)
+  if (!emaInit) {
+    emaI1 = i1_raw;
+    emaI2 = i2_raw;
+    emaInit = true;
+  } else {
+    emaI1 = EMA_ALPHA_AKIM * i1_raw + (1.0 - EMA_ALPHA_AKIM) * emaI1;
+    emaI2 = EMA_ALPHA_AKIM * i2_raw + (1.0 - EMA_ALPHA_AKIM) * emaI2;
+  }
+  float i1 = emaI1; // Serial çıktıda ve loglarda bu değer kullanılır
+  float i2 = emaI2;
+
+  // — Voltaj ve basınç ölçümleri —
+  float v27 = measureVoltage(PIN_VOLTAJ_1); // Pil takip – V27
+  float v28 = measureVoltage(PIN_VOLTAJ_2); // Pil takip – V28
+  // Basınç: ham ADC → ham bar → kalibre edilmiş gerçek bar
+  float p1  = kalibreBasinc(adcToBar(analogRead(PIN_BASINC_1)));
+
+
+  // P2 → Sensör yok, rastgele veri üret (0.0–10.0 bar arası)
+  float p2 = (float)random(0, 1001) / 100.0;
+
+  // ─── 4. Basınç Kompresör & Acil Durum Mantığı ─────────────
+  //
+  //  ACİL DURUM HİSTEREZİ (basincAcilDurum — global):
+  //   p1 < 3.5              → Acil duruma GİR  + Kompresör ON
+  //   3.5 ≤ p1 < 5.0        → Acil durumda KAL (bir kez girdikten sonra)
+  //   p1 ≥ 5.0              → Acil durumdan ÇIK
+  //
+  //  KOMPRESÖR HİSTEREZİ (kompresorAktif — global):
+  //   p1 < 4.5              → Kompresör ON  (her durumda)
+  //   4.5 ≤ p1 < 5.5        → Kompresör önceki durumunu korur
+  //   p1 ≥ 5.5              → Kompresör OFF
+  //
+
+  // — Basınç Acil Durum Histerezi —
+  if (!basincAcilDurum && p1 < BASINC_ACIL_DURUM_ALT) {
+    // Normal durumdayken 3.5 bar altına düştü → Acil duruma GİR
+    basincAcilDurum = true;
+  } else if (basincAcilDurum && p1 >= BASINC_ACIL_DURUM_UST) {
+    // Acil durumdayken 5.0 bar'a ulaştı → Acil durumdan ÇIK
+    basincAcilDurum = false;
+  }
+  // Diğer tüm durumlarda basincAcilDurum değişmez (önceki durumu korur)
+
+  // — Kompresör Histerezi —
+  if (p1 < BASINC_KOMPRESYOR_ALT) {
+    // 4.5 bar altı → Her durumda kompresör çalışsın
+    kompresorAktif = true;
+  } else if (p1 >= BASINC_KOMPRESYOR_UST) {
+    // 5.5 bar ve üzeri → Kompresör kapat
+    kompresorAktif = false;
+  }
+  // 4.5–5.5 arası → kompresorAktif değişmez
+
+
+  // ─── 5. D4 / D7 Çıkış Kararı (Öncelik Sıralı) ────────────
+  //
+  //  Öncelik  1: D2=LOW  YV Sıcaklık 1        → D4=LOW, D7=LOW
+  //  Öncelik  2: D3=LOW  YV Sıcaklık 2        → D4=LOW, D7=LOW
+  //  Öncelik  3: BT sıcaklık yüksek           → D4=LOW, D7=LOW
+  //  Öncelik  4: D14=HIGH Arayüz Butonu        → D4=LOW, D7=HIGH
+  //  Öncelik  5: D15=LOW  RPi Canlılık         → D4=LOW, D7=HIGH
+  //  Öncelik  6: D16=LOW  Navigasyon Canlılık  → D4=LOW, D7=HIGH
+  //  Öncelik  7: D29=LOW  YV Girişi 1          → D4=LOW, D7=HIGH
+  //  Öncelik  8: D31=LOW  YV Akım Girişi 1     → D4=LOW, D7=HIGH
+  //  Öncelik  9: D33=LOW  YV Girişi 2          → D4=LOW, D7=HIGH
+  //  Öncelik 10: Basınç < 3.5 bar              → D4=LOW, D7=HIGH
+  //  Normal    : Hiçbir koşul yok              → D4=HIGH, D7=HIGH
+  //
+  int cikis1Durum; // D4
+  int cikis2Durum; // D7
+
+  if (yvSicaklik1Low) {
+    // Öncelik 1: D2=LOW → YV Sıcaklık Girişi 1 alarmı
+    cikis1Durum = LOW;
+    cikis2Durum = LOW;
+  } else if (yvSicaklik2Low) {
+    // Öncelik 2: D3=LOW → YV Sıcaklık Girişi 2 alarmı
+    cikis1Durum = LOW;
+    cikis2Durum = LOW;
+  } else if (sicaklikAcilDurum) {
+    // Öncelik 3: Batarya Sıcaklığı (BT1 veya BT2 > 55°C)
+    cikis1Durum = LOW;
+    cikis2Durum = LOW;
+  } else if (arayuzButonHigh) {
+    // Öncelik 4: D14=HIGH → Arayüz Acil Durum Butonu
+    cikis1Durum = LOW;
+    cikis2Durum = HIGH;
+  } else if (rpiCanlilikLow) {
+    // Öncelik 5: D15=LOW → RPi Canlılık Kaybı
+    cikis1Durum = LOW;
+    cikis2Durum = HIGH;
+  } else if (navCanlilikLow) {
+    // Öncelik 6: D16=LOW → Navigasyon Canlılık Kaybı
+    cikis1Durum = LOW;
+    cikis2Durum = HIGH;
+  } else if (yvGiris1Low) {
+    // Öncelik 7: D29=LOW → Yüksek Voltaj Girişi 1
+    cikis1Durum = LOW;
+    cikis2Durum = HIGH;
+  } else if (yvAkimGiris1Low) {
+    // Öncelik 8: D31=LOW → Yüksek Voltaj Akım Girişi 1
+    cikis1Durum = LOW;
+    cikis2Durum = HIGH;
+  } else if (yvGiris2Low) {
+    // Öncelik 9: D33=LOW → Yüksek Voltaj Girişi 2
+    cikis1Durum = LOW;
+    cikis2Durum = HIGH;
+  } else if (basincAcilDurum) {
+    // Öncelik 10: Düşük Basınç (P1 < 3.5 bar)
+    cikis1Durum = LOW;
+    cikis2Durum = HIGH;
+  } else {
+    // Normal Durum — tüm koşullar sağlıklı
+    cikis1Durum = HIGH;
+    cikis2Durum = HIGH;
+  }
+
+
+  // ─── 6. Çıkışları Uygula ─────────────────────────────────
+  digitalWrite(PIN_ACIL_CIKIS_1,   cikis1Durum);
+  digitalWrite(PIN_ACIL_CIKIS_2,   cikis2Durum);
+  digitalWrite(PIN_KOMPRESOR_CIKIS, kompresorAktif ? LOW : HIGH);
+
+  // ─── 6.5 Akım Sensörü Otomatik Sıfır-Offset Yeniden Kalibrasyonu ──
+  //
+  // Kompresör kapalı durumu 5 saniye sürdüğünde otomatik kalibre eder.
+  // Önceki "geçiş bazlı" yaklaşımın aksine bu yöntem:
+  //   - Manuel güç kesmelerinde de çalışır
+  //   - Baştan beri kapalıysa da ilk 5 saniyede kalibre eder
+  //   - Kalibrasyon sonrası EMA geçmişi sıfırlanır → ekran anında 0A gösterir
+  //
+  if (!kompresorAktif) {
+    if (!kompresorKapaliSayiyoruz) {
+      // Kompresör yeni kapandı (veya program başından beri kapalı)
+      kompresorKapaliBaslangic  = millis();
+      kompresorKapaliSayiyoruz  = true;
+      sifirKalibrasyonYapildi   = false;
+    }
+
+    if (!sifirKalibrasyonYapildi &&
+        (millis() - kompresorKapaliBaslangic >= SIFIR_KALIBRASYON_BEKLEME_MS)) {
+      // 5 saniye kapalı kaldı → artık mıknatıslanma büyük ölçüde dinmiştir
+      long sum1 = 0, sum2 = 0;
+      for (int i = 0; i < CURRENT_NUM_SAMPLES; i++) {
+        sum1 += analogRead(PIN_AKIM_1);
+        sum2 += analogRead(PIN_AKIM_2);
+      }
+      zeroCurrentOffsetmV1 = ((float)sum1 / CURRENT_NUM_SAMPLES) / ADC_UNIT_PER_MV;
+      zeroCurrentOffsetmV2 = ((float)sum2 / CURRENT_NUM_SAMPLES) / ADC_UNIT_PER_MV;
+      sifirKalibrasyonYapildi = true;
+
+      // EMA geçmişini de sıfırla: bir sonraki döngüde ekran anında 0A gösterir
+      emaI1 = 0.0;
+      emaI2 = 0.0;
+    }
+
+  } else {
+    // Kompresör açık → sayacı ve bayrağı sıfırla
+    kompresorKapaliSayiyoruz = false;
+    sifirKalibrasyonYapildi  = false;
+  }
+
+  // ─── 7. Serial Çıktı (500 ms'de bir) ─────────────────────
+  unsigned long simdikiZaman = millis();
+  if (simdikiZaman - sonSeriZaman >= SERI_ARALIK_MS) {
+    sonSeriZaman = simdikiZaman;
+
+    // ACIL_DURUM bayrağı: D4 veya D7 LOW ise 1, her ikisi HIGH ise 0
+    int acilDurumBayragi = ((cikis1Durum == LOW) || (cikis2Durum == LOW)) ? 1 : 0;
+
+    // ── Tanı için ham ADC değeri ──────────────────────────────
+    // ACS758LCB-050B beklentisi (VCC=5V, ters bağlı sensör):
+    //   0A  → A0_RAW ≈ 512
+    //   6A  → A0_RAW ≈ 512 - 74 = 438  (6A × 12.276 ADC/A)
+    //   12A → A0_RAW ≈ 512 - 147 = 365
+    // Eğer bu kadar değişim görmüyorsanız → fiziksel bağlantı sorunlu.
+    int a0Raw = analogRead(PIN_AKIM_1);
+
+    // Serial çıktı formatı:
+    // BT1:xx.xx,BT2:xx.xx,I1:xx.xx,I2:xx.xx,V27:xx.xx,V28:xx.xx,P1:xx.xx,P2:xx.xx,ACIL_DURUM:x,A0_RAW:xxx
+    Serial.print("BT1:");
+    Serial.print(bt1, 2);
+    Serial.print(",BT2:");
+    Serial.print(bt2, 2);
+    Serial.print(",I1:");
+    Serial.print(i1, 2);
+    Serial.print(",I2:");
+    Serial.print(i2, 2);
+    Serial.print(",V27:");
+    Serial.print(v27, 2);
+    Serial.print(",V28:");
+    Serial.print(v28, 2);
+    Serial.print(",P1:");
+    Serial.print(p1, 2);
+    Serial.print(",P2:");
+    Serial.print(p2, 2);
+    Serial.print(",ACIL_DURUM:");
+    Serial.print(acilDurumBayragi);
+    Serial.print(",A0_RAW:");
+    Serial.println(a0Raw);
+
+  }
+}
