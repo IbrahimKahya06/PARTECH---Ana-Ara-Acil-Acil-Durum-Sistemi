@@ -1,0 +1,609 @@
+/*
+ * ============================================================
+ *  PARTECH Hyperloop - Ana Araç Acil Durum Sistemi (ADS)
+ *  Mikrodenetleyici : Arduino MEGA 2560
+ *  Tarih            : 2026
+ *  Versiyon         : v4 — Kapsamlı Yazılım Filtresi
+ * ============================================================
+ *
+ *  PARTECH_ADS.ino üzerine inşa edilmiştir (tüm kalibrasyon
+ *  değerleri korunmuştur). Ek olarak v2'nin DS18B20 non-blocking
+ *  yaklaşımı da entegre edilmiştir.
+ *
+ *  v4'te eklenen filtreler:
+ *  ─────────────────────────────────────────────────────────
+ *  [DIG-IN]  Dijital giriş debounce (DEBOUNCE_MS = 20ms)
+ *              • Her pin için durum 20ms boyunca sabit
+ *                kalmadıkça alarm mantığına verilmiyor.
+ *              • VFD EMI'sının µs-ms mertebesindeki spike'ları
+ *                alarm tetikleyemiyor.
+ *
+ *  [DIG-OUT] Dijital çıkış minimum tutma süresi (100ms)
+ *              • D49 veya D7 LOW'a girince en az 100ms
+ *                LOW'da tutuluyor — röle çarpışması engelleniyor.
+ *              • Gerçek acil durumda röle sağlıklı çalışıyor.
+ *
+ *  [BASINC]  P1 ve P2 için 5 örnekli ADC ortalaması + EMA
+ *              • Her döngüde 5 ADC okuması → ortalama ham bar
+ *              • Döngüler arası EMA (α=0.20)
+ *              • Basınç kaynaklı alarm kararları daha kararlı.
+ *
+ *  [VOLTAJ]  V27 ve V28 için döngüler arası EMA (α=0.20)
+ *              • measureVoltage() zaten 50 örnek alıyor;
+ *                EMA ikinci aşama filtre ekliyor.
+ *
+ *  [AKIM]    EMA (α=0.15) zaten mevcuttu, korundu.
+ *
+ *  [SICAKLIK] BT1 ve BT2 için EMA (α=0.30) +
+ *              ardışık okuma sayacı (3 onay gerekli)
+ *              • DS18B20'nin hata okuması (-127°C) zaten
+ *                SICAKLIK_HATA_ESIK ile yoksayılıyor.
+ *              • Geçici spike'ların alarm vermesi engelleniyor.
+ *              • 3 ardışık onay ≈ 3 saniye gerçek ısı artışı.
+ *
+ * ============================================================
+ *
+ *  PIN HARİTASI
+ *  ─────────────────────────────────────────────────────────
+ *  D2  → Dijital Giriş  : Yuksek_Voltaj_Sicaklik_Girisi_1  (LOW = acil)
+ *  D3  → Dijital Giriş  : Yuksek_Voltaj_Sicaklik_Girisi_2  (LOW = acil)
+ *  D14 → Dijital Giriş  : Arayuz_Acil_Durum_Butonu_Giris   (HIGH = acil)
+ *  D15 → Dijital Giriş  : Raspberry_Pi_5_Canlilik_Giris     (LOW = acil)
+ *  D16 → Dijital Giriş  : Navigasyon_Canlilik_Giris         (LOW = acil)
+ *  D29 → Dijital Giriş  : Yuksek_Voltaj_Girisi_1            (LOW = acil)
+ *  D31 → Dijital Giriş  : Yuksek_Voltaj_Akim_Girisi_1       (LOW = acil)
+ *  D33 → Dijital Giriş  : Yuksek_Voltaj_Girisi_2            (LOW = acil)
+ *  D49 → Dijital Çıkış  : Acil_Durum_Cikisi_1  (D4→D51→D49)
+ *  D7  → Dijital Çıkış  : Acil_Durum_Cikisi_2
+ *  D18 → Dijital Çıkış  : Kompresor_Cikis
+ *  D25 → DS18B20        : BT1_Sicaklik
+ *  D27 → DS18B20        : BT2_Sicaklik
+ *  A0  → ACS712 30A     : Akim_1 (I1)
+ *  A1  → Pil Takip Dev. : Voltaj_1 (V27)
+ *  A2  → ACS758LCB      : Akim_2 (I2)
+ *  A3  → Pil Takip Dev. : Voltaj_2 (V28)
+ *  A4  → 10 bar Basınç  : Basinc_1 (P1)
+ *  A5  → 10 bar Basınç  : Basinc_2 (P2)
+ * ============================================================
+ *
+ *  ACİL DURUM ÖNCELİK SIRASI (D49 / D7 kararı)
+ *  1.  D2=LOW   YV Sıcaklık 1           → D49=LOW, D7=LOW
+ *  2.  D3=LOW   YV Sıcaklık 2           → D49=LOW, D7=LOW
+ *  3.  BT1/BT2 > 55°C (3 onay)         → D49=LOW, D7=LOW
+ *  4.  D14=HIGH Arayüz Butonu           → D49=LOW, D7=HIGH
+ *  5.  D15=LOW  RPi Canlılık            → D49=LOW, D7=HIGH
+ *  6.  D16=LOW  Navigasyon Canlılık     → D49=LOW, D7=HIGH
+ *  7.  D29=LOW  YV Girisi 1             → D49=LOW, D7=HIGH
+ *  8.  D31=LOW  YV Akım Girisi 1        → D49=LOW, D7=HIGH
+ *  9.  D33=LOW  YV Girisi 2             → D49=LOW, D7=HIGH
+ *  10. P1 veya P2 < 3.5 bar            → D49=LOW, D7=HIGH
+ *  Normal                               → D49=HIGH, D7=HIGH
+ *
+ *  Tüm kararlar 20ms debounce sonrası verilir.
+ *  LOW çıkışlar en az 100ms LOW'da tutulur.
+ * ============================================================
+ */
+
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// ─── Pin Tanımlamaları ──────────────────────────────────────
+const int PIN_YV_SICAKLIK_GIRIS_1 = 2;
+const int PIN_YV_SICAKLIK_GIRIS_2 = 3;
+const int PIN_ARAYUZ_BUTON_GIRIS  = 14;
+const int PIN_RPI_CANLILIK_GIRIS  = 15;
+const int PIN_NAV_CANLILIK_GIRIS  = 16;
+const int PIN_YV_GIRIS_1          = 29;
+const int PIN_YV_AKIM_GIRIS_1     = 31;
+const int PIN_YV_GIRIS_2          = 33;
+const int PIN_ACIL_CIKIS_1        = 49;  // D4→D51→D49
+const int PIN_ACIL_CIKIS_2        = 7;
+const int PIN_KOMPRESOR_CIKIS     = 18;
+const int PIN_BT1                 = 25;
+const int PIN_BT2                 = 27;
+const int PIN_AKIM_1              = A0;
+const int PIN_VOLTAJ_1            = A1;
+const int PIN_AKIM_2              = A2;
+const int PIN_VOLTAJ_2            = A3;
+const int PIN_BASINC_1            = A4;
+const int PIN_BASINC_2            = A5;
+
+// ─── DS18B20 Nesneleri ──────────────────────────────────────
+OneWire oneWireBT1(PIN_BT1);
+OneWire oneWireBT2(PIN_BT2);
+DallasTemperature sensorBT1(&oneWireBT1);
+DallasTemperature sensorBT2(&oneWireBT2);
+
+// ─── Sıcaklık Eşikleri ──────────────────────────────────────
+const float SICAKLIK_ESIK      = 55.0;
+const float SICAKLIK_HATA_ESIK = -100.0;
+
+// ─── DS18B20 Non-Blocking Zamanlama (v2'den) ─────────────────
+const unsigned long BT_DONUSUM_MS = 750;
+const unsigned long BT_ARALIK_MS  = 1000;
+unsigned long btIstemZaman = 0;
+bool          btIstemAktif = false;
+float bt1 = -127.0;
+float bt2 = -127.0;
+
+// ─── Basınç Eşikleri ────────────────────────────────────────
+const float BASINC_ACIL_DURUM_ALT = 3.5;
+const float BASINC_ACIL_DURUM_UST = 5.0;
+const float BASINC_KOMPRESYOR_ALT = 4.5;
+const float BASINC_KOMPRESYOR_UST = 5.5;
+
+// ─── Basınç Sensörü Kalibrasyon Sabitleri ───────────────────
+const float ADC_MAX        = 1023.0;
+const float VCC            = 5.0;
+const float SENSOR_V_MIN   = 0.5;
+const float SENSOR_V_MAX   = 4.5;
+const float BASINC_MAX_BAR = 10.0;
+const int   BASINC_ORNEK_SAYISI = 5; // Her döngüde alınan ADC örnek sayısı
+
+// ─── Akım Sensörü Kalibrasyon Sabitleri ─────────────────────
+const float I1_SENSITIVITY_MV_PER_A = 66.0;
+const float I2_SENSITIVITY_MV_PER_A = 40.0;
+const float ADC_UNIT_PER_MV         = ADC_MAX / (VCC * 1000.0);
+const int   CURRENT_NUM_SAMPLES     = 50;
+const float I1_KALIBRASYON          = 0.156;
+// I2 kalibrasyon: Gerçek 10A → Ekran -7.35A → ham -1.811A
+// Yeni: 10 / (-1.811) = -5.52  (negatif = yön düzeltmesi)
+const float I2_KALIBRASYON          = -5.52;
+const float I1_GURULTU_ESIGI        = 0.5;
+const float I2_GURULTU_ESIGI        = 7.0;
+
+float zeroCurrentOffsetmV1 = 0.0;
+float zeroCurrentOffsetmV2 = 0.0;
+
+// ─── Voltaj Kalibrasyon Sabitleri ───────────────────────────
+const float R1 = 30000.0;
+const float R2 = 7500.0;
+// V27 (A1): Multimetre=15.78V, Pin sinyal=1.276V → 15.78/(1.276×5)=2.474
+const float VOLTAGE_CALIBRATION_V27 = 2.474;
+// V28 (A3): Multimetre=15.84V, Pin sinyal=1.44V  → 15.84/(1.44×5)=2.200
+const float VOLTAGE_CALIBRATION_V28 = 2.200;
+
+// ─── EMA Katsayıları ─────────────────────────────────────────
+const float EMA_ALPHA_AKIM    = 0.15; // I1, I2
+const float EMA_ALPHA_VOLTAJ  = 0.20; // V27, V28
+const float EMA_ALPHA_BASINC  = 0.20; // P1, P2
+const float EMA_ALPHA_SICAKLIK = 0.30; // BT1, BT2
+
+// ─── EMA Durum Değişkenleri ──────────────────────────────────
+float emaI1 = 0.0, emaI2 = 0.0;
+bool  emaAkimInit = false;
+
+float emaV27 = 0.0, emaV28 = 0.0;
+bool  emaVoltajInit = false;
+
+float emaP1 = 0.0, emaP2 = 0.0;
+bool  emaBasincInit = false;
+
+float emaBT1 = 25.0, emaBT2 = 25.0;
+bool  emaSicaklikInit = false;
+
+// ─── Sıcaklık Alarm Doğrulama Sayacı ────────────────────────
+// DS18B20 okumaları 1 saniyede bir yapılır.
+// 3 ardışık onay ≈ 3 saniye gerçek ısı artışı gerekli.
+// Tek spike veya kısa bozukluk alarm tetikleyemez.
+const int BT_ALARM_SAYAC_ESIK = 3;
+int bt1AlarmSayac = 0;
+int bt2AlarmSayac = 0;
+
+// ─── Dijital Giriş Debounce ──────────────────────────────────
+// Alarm kararı için pin durumunun DEBOUNCE_MS boyunca
+// sürekli aynı kalması zorunludur.
+// VFD'nin µs-ms mertebesindeki EMI spike'ları geçemez.
+const unsigned long DEBOUNCE_MS = 20;
+
+struct DebouncePin {
+    int  onayliDurum;        // Alarm mantığında kullanılan onaylı durum
+    int  geciciDurum;        // Yeni okunan ama henüz onaylanmamış durum
+    unsigned long degisimMs; // Gecici durumun başladığı zaman
+};
+
+// 8 dijital giriş için debounce yapısı
+// Sıra: D2, D3, D14, D15, D16, D29, D31, D33
+DebouncePin dbPinler[8];
+
+// ─── Dijital Çıkış Minimum Tutma Süresi ─────────────────────
+// D49 veya D7 LOW'a girince en az CIKIS_TUTMA_MS boyunca
+// LOW'da tutulur — röle çarpışması (chatter) engellenir.
+const unsigned long CIKIS_TUTMA_MS = 100;
+
+bool          acil1AktifTutma  = false;
+unsigned long acil1BaslangicMs = 0;
+bool          acil2AktifTutma  = false;
+unsigned long acil2BaslangicMs = 0;
+
+// ─── Kalıcı Durum Değişkenleri ──────────────────────────────
+bool kompresorAktif   = false;
+bool basincAcilDurum  = false;
+bool basincAcilDurum2 = false;
+
+// ─── Zamanlama ──────────────────────────────────────────────
+const unsigned long SERI_ARALIK_MS = 1000;
+unsigned long sonSeriZaman = 0;
+
+// ─── Akım Sensörü Otomatik Sıfır Kalibrasyonu ───────────────
+const unsigned long SIFIR_KALIBRASYON_BEKLEME_MS = 5000;
+unsigned long kompresorKapaliBaslangic = 0;
+bool kompresorKapaliSayiyoruz = false;
+bool sifirKalibrasyonYapildi  = false;
+
+
+// ============================================================
+//  YARDIMCI FONKSİYONLAR
+// ============================================================
+
+// ─── Debounce Güncelleme ─────────────────────────────────────
+// Her loop iterasyonunda her giriş pini için çağrılır.
+// Mantık:
+//   1. Yeni okuma geciciDurum'dan farklıysa → geciciDurum güncelle,
+//      değişim zamanını kaydet (timer sıfırla).
+//   2. Gecici durum DEBOUNCE_MS boyunca stabil kaldıysa →
+//      onayliDurum'u güncelle.
+//   3. Alarm mantığı her zaman onayliDurum'u kullanır.
+void debounceGuncelle(DebouncePin &db, int yeniOkuma, unsigned long simdi) {
+    if (yeniOkuma != db.geciciDurum) {
+        db.geciciDurum = yeniOkuma;
+        db.degisimMs   = simdi;
+    }
+    if ((simdi - db.degisimMs) >= DEBOUNCE_MS) {
+        db.onayliDurum = db.geciciDurum;
+    }
+}
+
+// ─── ADC → Ham Bar ──────────────────────────────────────────
+float adcToBar(float adcOrtalama) {
+    float voltaj = (adcOrtalama / ADC_MAX) * VCC;
+    float bar    = (voltaj - SENSOR_V_MIN) / ((SENSOR_V_MAX - SENSOR_V_MIN) / BASINC_MAX_BAR);
+    if (bar < 0.0) bar = 0.0;
+    return bar;
+}
+
+// ─── Basınç Kalibrasyon Tablosu (Parça-Parça Doğrusal) ──────
+const int   P_TABLO_BOYUT = 9;
+const float P_HAM[P_TABLO_BOYUT]    = {0.00, 0.53, 1.97, 3.33, 4.84, 6.18, 7.91, 9.15, 10.70};
+const float P_GERCEK[P_TABLO_BOYUT] = {0.00, 1.00, 2.00, 3.00, 4.00, 5.00, 6.00, 7.00,  8.00};
+
+float kalibreBasinc(float hamBar) {
+    if (hamBar <= P_HAM[0]) return P_GERCEK[0];
+    if (hamBar >= P_HAM[P_TABLO_BOYUT - 1]) return P_GERCEK[P_TABLO_BOYUT - 1];
+    for (int i = 0; i < P_TABLO_BOYUT - 1; i++) {
+        if (hamBar <= P_HAM[i + 1]) {
+            float oran = (hamBar - P_HAM[i]) / (P_HAM[i + 1] - P_HAM[i]);
+            return P_GERCEK[i] + oran * (P_GERCEK[i + 1] - P_GERCEK[i]);
+        }
+    }
+    return P_GERCEK[P_TABLO_BOYUT - 1];
+}
+
+// ─── Akım Ölçümü ─────────────────────────────────────────────
+float measureCurrent(int pin, float zeroOffsetmV, float sensitivityMVperA,
+                     float iKalibrasyon, float noiseThreshold) {
+    long toplam = 0;
+    for (int i = 0; i < CURRENT_NUM_SAMPLES; i++) toplam += analogRead(pin);
+    float voltajmV = ((float)toplam / CURRENT_NUM_SAMPLES) / ADC_UNIT_PER_MV;
+    float akim_A   = (voltajmV - zeroOffsetmV) / sensitivityMVperA * iKalibrasyon;
+    if (abs(akim_A) < noiseThreshold) akim_A = 0.0;
+    return akim_A;
+}
+
+// ─── Voltaj Ölçümü ───────────────────────────────────────────
+float measureVoltage(int pin, float calibration) {
+    long toplam = 0;
+    for (int i = 0; i < CURRENT_NUM_SAMPLES; i++) toplam += analogRead(pin);
+    float adcOrtalama = (float)toplam / CURRENT_NUM_SAMPLES;
+    float adcVoltaj   = adcOrtalama * (VCC / ADC_MAX);
+    return (adcVoltaj * ((R1 + R2) / R2)) * calibration;
+}
+
+
+// ============================================================
+//  SETUP
+// ============================================================
+void setup() {
+    Serial.begin(9600);
+
+    // ─── Dijital Giriş Pinleri ────────────────────────────────
+    // LOW=acil → INPUT_PULLUP (kablo yokken HIGH = güvenli durum)
+    pinMode(PIN_YV_SICAKLIK_GIRIS_1, INPUT_PULLUP); // D2
+    pinMode(PIN_YV_SICAKLIK_GIRIS_2, INPUT_PULLUP); // D3
+    pinMode(PIN_RPI_CANLILIK_GIRIS,  INPUT_PULLUP); // D15
+    pinMode(PIN_NAV_CANLILIK_GIRIS,  INPUT_PULLUP); // D16
+    pinMode(PIN_YV_GIRIS_1,          INPUT_PULLUP); // D29
+    pinMode(PIN_YV_AKIM_GIRIS_1,     INPUT_PULLUP); // D31
+    pinMode(PIN_YV_GIRIS_2,          INPUT_PULLUP); // D33
+    // HIGH=acil → plain INPUT
+    pinMode(PIN_ARAYUZ_BUTON_GIRIS,  INPUT);        // D14
+
+    // ─── Dijital Çıkış Pinleri ────────────────────────────────
+    pinMode(PIN_ACIL_CIKIS_1,    OUTPUT);
+    pinMode(PIN_ACIL_CIKIS_2,    OUTPUT);
+    pinMode(PIN_KOMPRESOR_CIKIS, OUTPUT);
+
+    // Başlangıç güvenli durum: HIGH = röle kapalı
+    digitalWrite(PIN_ACIL_CIKIS_1,   HIGH);
+    digitalWrite(PIN_ACIL_CIKIS_2,   HIGH);
+    digitalWrite(PIN_KOMPRESOR_CIKIS, HIGH);
+
+    // ─── Debounce Yapısı Başlangıç Durumları ─────────────────
+    // LOW-tetiklemeli pinler: güvenli durum = HIGH (INPUT_PULLUP)
+    // HIGH-tetiklemeli (D14): güvenli durum = LOW
+    for (int i = 0; i < 8; i++) {
+        int guvenliDurum = (i == 2) ? LOW : HIGH; // index 2 = D14
+        dbPinler[i].onayliDurum = guvenliDurum;
+        dbPinler[i].geciciDurum = guvenliDurum;
+        dbPinler[i].degisimMs   = 0;
+    }
+
+    // ─── DS18B20 Non-Blocking Başlatma ───────────────────────
+    sensorBT1.begin();
+    sensorBT2.begin();
+    sensorBT1.setWaitForConversion(false); // Bloklamayan mod
+    sensorBT2.setWaitForConversion(false);
+    sensorBT1.requestTemperatures();       // İlk istek
+    sensorBT2.requestTemperatures();
+    btIstemAktif = true;
+    btIstemZaman = millis();
+
+    // ─── Akım Sensörü Sıfır-Offset Kalibrasyonu ─────────────
+    {
+        long sum1 = 0, sum2 = 0;
+        for (int i = 0; i < CURRENT_NUM_SAMPLES; i++) {
+            sum1 += analogRead(PIN_AKIM_1);
+            sum2 += analogRead(PIN_AKIM_2);
+            delay(5);
+        }
+        zeroCurrentOffsetmV1 = ((float)sum1 / CURRENT_NUM_SAMPLES) / ADC_UNIT_PER_MV;
+        zeroCurrentOffsetmV2 = ((float)sum2 / CURRENT_NUM_SAMPLES) / ADC_UNIT_PER_MV;
+    }
+} // setup() sonu
+
+
+// ============================================================
+//  LOOP
+// ============================================================
+void loop() {
+    unsigned long simdi = millis();
+
+    // ─── 1. Dijital Girişleri Oku + Debounce ─────────────────
+    //
+    // Ham okumalar debounceGuncelle()'ye verilir.
+    // Alarm mantığı daima onayliDurum'u kullanır.
+    // 20ms'den kısa süren parazit spike'ları onaylanamaz.
+    //
+    debounceGuncelle(dbPinler[0], digitalRead(PIN_YV_SICAKLIK_GIRIS_1), simdi); // D2
+    debounceGuncelle(dbPinler[1], digitalRead(PIN_YV_SICAKLIK_GIRIS_2), simdi); // D3
+    debounceGuncelle(dbPinler[2], digitalRead(PIN_ARAYUZ_BUTON_GIRIS),  simdi); // D14
+    debounceGuncelle(dbPinler[3], digitalRead(PIN_RPI_CANLILIK_GIRIS),  simdi); // D15
+    debounceGuncelle(dbPinler[4], digitalRead(PIN_NAV_CANLILIK_GIRIS),  simdi); // D16
+    debounceGuncelle(dbPinler[5], digitalRead(PIN_YV_GIRIS_1),          simdi); // D29
+    debounceGuncelle(dbPinler[6], digitalRead(PIN_YV_AKIM_GIRIS_1),     simdi); // D31
+    debounceGuncelle(dbPinler[7], digitalRead(PIN_YV_GIRIS_2),          simdi); // D33
+
+    // Onaylanmış alarm bayrakları
+    bool yvSicaklik1Low  = (dbPinler[0].onayliDurum == LOW);
+    bool yvSicaklik2Low  = (dbPinler[1].onayliDurum == LOW);
+    bool arayuzButonHigh = (dbPinler[2].onayliDurum == HIGH);
+    bool rpiCanlilikLow  = (dbPinler[3].onayliDurum == LOW);
+    bool navCanlilikLow  = (dbPinler[4].onayliDurum == LOW);
+    bool yvGiris1Low     = (dbPinler[5].onayliDurum == LOW);
+    bool yvAkimGiris1Low = (dbPinler[6].onayliDurum == LOW);
+    bool yvGiris2Low     = (dbPinler[7].onayliDurum == LOW);
+
+    // ─── 2. DS18B20 Sıcaklık Okuma (Non-Blocking) ────────────
+    //
+    // Adım A: 750ms dönüşüm süresi geçtiyse değeri oku.
+    // Adım B: 1000ms aralık geçtiyse yeni istek gönder.
+    // EMA ve alarm sayacı sadece yeni okuma geldiğinde güncellenir.
+    //
+    if (btIstemAktif && (simdi - btIstemZaman >= BT_DONUSUM_MS)) {
+        bt1 = sensorBT1.getTempCByIndex(0);
+        bt2 = sensorBT2.getTempCByIndex(0);
+        btIstemAktif = false;
+
+        // — BT1 EMA + Alarm Sayacı —
+        if (bt1 > SICAKLIK_HATA_ESIK) {
+            emaBT1 = emaSicaklikInit
+                     ? (EMA_ALPHA_SICAKLIK * bt1 + (1.0 - EMA_ALPHA_SICAKLIK) * emaBT1)
+                     : bt1;
+            // Sayaç: 0 ile BT_ALARM_SAYAC_ESIK arasında klamp
+            if (emaBT1 > SICAKLIK_ESIK) bt1AlarmSayac = min(bt1AlarmSayac + 1, BT_ALARM_SAYAC_ESIK);
+            else                         bt1AlarmSayac = max(bt1AlarmSayac - 1, 0);
+        }
+
+        // — BT2 EMA + Alarm Sayacı —
+        if (bt2 > SICAKLIK_HATA_ESIK) {
+            emaBT2 = emaSicaklikInit
+                     ? (EMA_ALPHA_SICAKLIK * bt2 + (1.0 - EMA_ALPHA_SICAKLIK) * emaBT2)
+                     : bt2;
+            if (emaBT2 > SICAKLIK_ESIK) bt2AlarmSayac = min(bt2AlarmSayac + 1, BT_ALARM_SAYAC_ESIK);
+            else                         bt2AlarmSayac = max(bt2AlarmSayac - 1, 0);
+            emaSicaklikInit = true;
+        }
+    }
+
+    if (!btIstemAktif && (simdi - btIstemZaman >= BT_ARALIK_MS)) {
+        sensorBT1.requestTemperatures();
+        sensorBT2.requestTemperatures();
+        btIstemAktif = true;
+        btIstemZaman  = simdi;
+    }
+
+    // Sıcaklık alarmı: 3 ardışık onaylı okuma gerekli
+    // Tek bir spike veya kısa bozukluk alarm tetikleyemez.
+    bool sicaklikAcilDurum = (bt1AlarmSayac >= BT_ALARM_SAYAC_ESIK) ||
+                              (bt2AlarmSayac >= BT_ALARM_SAYAC_ESIK);
+
+    // ─── 3. Akım Ölçümü + EMA ────────────────────────────────
+    float i1_raw = measureCurrent(PIN_AKIM_1, zeroCurrentOffsetmV1,
+                                  I1_SENSITIVITY_MV_PER_A, I1_KALIBRASYON,
+                                  I1_GURULTU_ESIGI);
+    float i2_raw = measureCurrent(PIN_AKIM_2, zeroCurrentOffsetmV2,
+                                  I2_SENSITIVITY_MV_PER_A, I2_KALIBRASYON,
+                                  I2_GURULTU_ESIGI);
+    if (!emaAkimInit) {
+        emaI1 = i1_raw; emaI2 = i2_raw; emaAkimInit = true;
+    } else {
+        emaI1 = EMA_ALPHA_AKIM * i1_raw + (1.0 - EMA_ALPHA_AKIM) * emaI1;
+        emaI2 = EMA_ALPHA_AKIM * i2_raw + (1.0 - EMA_ALPHA_AKIM) * emaI2;
+    }
+    float i1 = emaI1;
+    float i2 = emaI2;
+
+    // ─── 4. Voltaj Ölçümü + EMA ──────────────────────────────
+    // measureVoltage() kendi içinde 50 örnek ortalaması alır.
+    // EMA ikinci aşama filtreyi ekler — döngüler arası kararlılık.
+    float v27_ham = measureVoltage(PIN_VOLTAJ_1, VOLTAGE_CALIBRATION_V27);
+    float v28_ham = measureVoltage(PIN_VOLTAJ_2, VOLTAGE_CALIBRATION_V28);
+    if (!emaVoltajInit) {
+        emaV27 = v27_ham; emaV28 = v28_ham; emaVoltajInit = true;
+    } else {
+        emaV27 = EMA_ALPHA_VOLTAJ * v27_ham + (1.0 - EMA_ALPHA_VOLTAJ) * emaV27;
+        emaV28 = EMA_ALPHA_VOLTAJ * v28_ham + (1.0 - EMA_ALPHA_VOLTAJ) * emaV28;
+    }
+    float v27 = emaV27;
+    float v28 = emaV28;
+
+    // ─── 5. Basınç Ölçümü: 5 Örnek Ortalama + EMA ────────────
+    // Her döngüde 5 ADC okuması → ortalama ham ADC → ham bar → kalibre bar
+    // Sonra döngüler arası EMA filtresi.
+    // Bu iki kademeli filtre basınç kaynaklı alarm kararlarını kararlı kılar.
+    {
+        long p1sum = 0, p2sum = 0;
+        for (int i = 0; i < BASINC_ORNEK_SAYISI; i++) {
+            p1sum += analogRead(PIN_BASINC_1);
+            p2sum += analogRead(PIN_BASINC_2);
+        }
+        float p1_ham = kalibreBasinc(adcToBar((float)p1sum / BASINC_ORNEK_SAYISI));
+        float p2_ham = kalibreBasinc(adcToBar((float)p2sum / BASINC_ORNEK_SAYISI));
+
+        if (!emaBasincInit) {
+            emaP1 = p1_ham; emaP2 = p2_ham; emaBasincInit = true;
+        } else {
+            emaP1 = EMA_ALPHA_BASINC * p1_ham + (1.0 - EMA_ALPHA_BASINC) * emaP1;
+            emaP2 = EMA_ALPHA_BASINC * p2_ham + (1.0 - EMA_ALPHA_BASINC) * emaP2;
+        }
+    }
+    float p1 = emaP1;
+    float p2 = emaP2;
+
+    // ─── 6. Basınç Acil Durum + Kompresör Histerezi ──────────
+    if (!basincAcilDurum  && p1 < BASINC_ACIL_DURUM_ALT) basincAcilDurum  = true;
+    else if (basincAcilDurum  && p1 >= BASINC_ACIL_DURUM_UST) basincAcilDurum  = false;
+
+    if (!basincAcilDurum2 && p2 < BASINC_ACIL_DURUM_ALT) basincAcilDurum2 = true;
+    else if (basincAcilDurum2 && p2 >= BASINC_ACIL_DURUM_UST) basincAcilDurum2 = false;
+
+    if (p1 < BASINC_KOMPRESYOR_ALT || p2 < BASINC_KOMPRESYOR_ALT)        kompresorAktif = true;
+    else if (p1 >= BASINC_KOMPRESYOR_UST && p2 >= BASINC_KOMPRESYOR_UST) kompresorAktif = false;
+
+    // ─── 7. D49 / D7 Çıkış Kararı (Öncelik Sıralı) ──────────
+    //
+    // Tüm koşullar debounce onaylı verilerle değerlendirilir.
+    // Sıcaklık alarmı 3 ardışık onay gerektiriyor.
+    //
+    int cikis1Durum; // D49
+    int cikis2Durum; // D7
+
+    if      (yvSicaklik1Low)                    { cikis1Durum = LOW;  cikis2Durum = LOW;  }
+    else if (yvSicaklik2Low)                    { cikis1Durum = LOW;  cikis2Durum = LOW;  }
+    else if (sicaklikAcilDurum)                 { cikis1Durum = LOW;  cikis2Durum = LOW;  }
+    else if (arayuzButonHigh)                   { cikis1Durum = LOW;  cikis2Durum = HIGH; }
+    else if (rpiCanlilikLow)                    { cikis1Durum = LOW;  cikis2Durum = HIGH; }
+    else if (navCanlilikLow)                    { cikis1Durum = LOW;  cikis2Durum = HIGH; }
+    else if (yvGiris1Low)                       { cikis1Durum = LOW;  cikis2Durum = HIGH; }
+    else if (yvAkimGiris1Low)                   { cikis1Durum = LOW;  cikis2Durum = HIGH; }
+    else if (yvGiris2Low)                       { cikis1Durum = LOW;  cikis2Durum = HIGH; }
+    else if (basincAcilDurum || basincAcilDurum2) { cikis1Durum = LOW; cikis2Durum = HIGH; }
+    else                                        { cikis1Durum = HIGH; cikis2Durum = HIGH; }
+
+    // ─── 8. Çıkış Minimum Tutma Süresi (Röle Çarpışma Önleme) ─
+    //
+    // D49 için:
+    // Alarm koşulu ortadan kalksa bile D49, CIKIS_TUTMA_MS
+    // dolmadan HIGH'a geçmez. Röle sağlıklı tetiklenir, spike
+    // sonrası anlık HIGH-LOW-HIGH geçişi (chatter) olmaz.
+    //
+    if (cikis1Durum == LOW) {
+        if (!acil1AktifTutma) {
+            acil1AktifTutma  = true;
+            acil1BaslangicMs = simdi;
+        }
+    } else {
+        if (acil1AktifTutma) {
+            if ((simdi - acil1BaslangicMs) < CIKIS_TUTMA_MS) {
+                cikis1Durum = LOW; // Henüz tutma süresi dolmadı
+            } else {
+                acil1AktifTutma = false; // Serbest bırak
+            }
+        }
+    }
+
+    // D7 için aynı mantık:
+    if (cikis2Durum == LOW) {
+        if (!acil2AktifTutma) {
+            acil2AktifTutma  = true;
+            acil2BaslangicMs = simdi;
+        }
+    } else {
+        if (acil2AktifTutma) {
+            if ((simdi - acil2BaslangicMs) < CIKIS_TUTMA_MS) {
+                cikis2Durum = LOW;
+            } else {
+                acil2AktifTutma = false;
+            }
+        }
+    }
+
+    // ─── 9. Çıkışları Uygula ─────────────────────────────────
+    digitalWrite(PIN_ACIL_CIKIS_1,   cikis1Durum);
+    digitalWrite(PIN_ACIL_CIKIS_2,   cikis2Durum);
+    digitalWrite(PIN_KOMPRESOR_CIKIS, kompresorAktif ? LOW : HIGH);
+
+    // ─── 9.5 Akım Sensörü Otomatik Sıfır-Offset Kalibrasyonu ──
+    if (!kompresorAktif) {
+        if (!kompresorKapaliSayiyoruz) {
+            kompresorKapaliBaslangic = simdi;
+            kompresorKapaliSayiyoruz = true;
+            sifirKalibrasyonYapildi  = false;
+        }
+        if (!sifirKalibrasyonYapildi &&
+            (simdi - kompresorKapaliBaslangic >= SIFIR_KALIBRASYON_BEKLEME_MS)) {
+            long sum1 = 0, sum2 = 0;
+            for (int i = 0; i < CURRENT_NUM_SAMPLES; i++) {
+                sum1 += analogRead(PIN_AKIM_1);
+                sum2 += analogRead(PIN_AKIM_2);
+            }
+            zeroCurrentOffsetmV1 = ((float)sum1 / CURRENT_NUM_SAMPLES) / ADC_UNIT_PER_MV;
+            zeroCurrentOffsetmV2 = ((float)sum2 / CURRENT_NUM_SAMPLES) / ADC_UNIT_PER_MV;
+            sifirKalibrasyonYapildi = true;
+            emaI1 = 0.0;
+            emaI2 = 0.0;
+        }
+    } else {
+        kompresorKapaliSayiyoruz = false;
+        sifirKalibrasyonYapildi  = false;
+    }
+
+    // ─── 10. Serial Çıktı (500 ms'de bir) ────────────────────
+    if (simdi - sonSeriZaman >= SERI_ARALIK_MS) {
+        sonSeriZaman = simdi;
+
+        int acilDurumBayragi = ((cikis1Durum == LOW) || (cikis2Durum == LOW)) ? 1 : 0;
+
+        // Tüm analog değerler EMA filtrelenmiş olarak gönderilir.
+        // Raspberry Pi'nin gördüğü veriler kararlı ve gürültüsüz.
+        Serial.print("BT1:"); Serial.print(emaBT1, 2);
+        Serial.print(",BT2:"); Serial.print(emaBT2, 2);
+        Serial.print(",I1:"); Serial.print(i1, 2);
+        Serial.print(",I2:"); Serial.print(i2, 2);
+        Serial.print(",V27:"); Serial.print(v28, 2);
+        Serial.print(",V28:"); Serial.print(v27, 2);
+        Serial.print(",P1:"); Serial.print(p1, 2);
+        Serial.print(",P2:"); Serial.print(p2, 2);
+        Serial.print(",ACIL_DURUM:"); Serial.println(acilDurumBayragi);
+    }
+}
